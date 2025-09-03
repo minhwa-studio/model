@@ -19,8 +19,8 @@ pipe = StableDiffusionControlNetPipeline.from_pretrained(
     torch_dtype=torch.float16
 )
 
-# 5000 스텝까지 학습된 LoRA 가중치 적용
-pipe.load_lora_weights("./sd15_lora_minhwa/checkpoint-5000", weight_name="pytorch_lora_weights.safetensors")
+# 최종 스텝부터 학습된 LoRA 가중치 적용
+pipe.load_lora_weights("./sd15_lora_minhwa/checkpoint-15000", weight_name="pytorch_lora_weights.safetensors")
 
 # 스케줄러 설정 (일반적으로 UniPCMultistepScheduler를 사용)
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
