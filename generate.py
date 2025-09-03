@@ -1,230 +1,186 @@
 # -*- coding: utf-8 -*-
+"""
+민화 수채화 스타일 (객체 마스크 없이, 엣지맵만으로 구도 고정)
+- LoRA: ./sd15_lora_minhwa/checkpoint-15000/pytorch_lora_weights.safetensors
+- HF: 로그인만 유지, 로딩은 캐시(local_files_only=True)
+"""
+
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
-import dotenv
-import torch
-import numpy as np
-import cv2
+import torch, numpy as np, cv2
 from PIL import Image
-
+import dotenv
 from huggingface_hub import login
 from diffusers import (
     StableDiffusionControlNetPipeline,
     ControlNetModel,
-    UniPCMultistepScheduler,          # 남겨두지만 본 프리셋은 EulerAncestral로 교체
     AutoencoderKL,
     EulerAncestralDiscreteScheduler,
 )
-from diffusers.utils import load_image
 
+# -----------------------------
+# 경로/설정
+# -----------------------------
+SOURCE_IMAGE = "./inputs/dog.jpg"
+OUT_PATH     = "./outputs/minhwa_watercolor.png"
 
-# ==============================
-# 0) 설정 (필요시 변경)
-# ==============================
-SOURCE_IMAGE = "./inputs/img1.jpg"
-OUT_DIR = Path("./outputs")
+LORA_FILE = Path("./sd15_lora_minhwa/checkpoint-15000/pytorch_lora_weights.safetensors")
+assert LORA_FILE.exists(), f"LoRA 없음: {LORA_FILE}"
 
-# 실행 스위치
-RUN_MID_PRESET = True   # 중간 톤 프리셋 1장
-RUN_GRID       = True   # 중간대 그리드 여러 장(아래 파라미터 참고)
+SEED, STEPS, CFG = 42, 38, 6.0
+ADAPTER_WEIGHT   = 0.70          # LoRA 약화(주제 덮어쓰기 방지)
+CN_SCALE         = 1.10          # ControlNet 강하게(구도 고정)
+GUIDE_START, GUIDE_END = 0.0, 1.0
 
-# 재현성 고정 시드
-SEED = 42
+# ---- 전역 엣지 제어(마스크 없음) ----
+TARGET_EDGE_DENSITY = 0.0045     # 0.45% 목표(필요시 0.003~0.006 사이로 조절)
+DENSITY_TOL         = 0.0015
+CANNY_LOW_INIT, CANNY_HIGH_INIT, CANNY_MAX_ITER = 25, 70, 8
 
-# ==============================
-# 1) Hugging Face 로그인
-# ==============================
+# 노이즈 정리(자잘한 조각 제거/얇게)
+MIN_COMPONENT_AREA = 140
+EDGE_ERODE_ITERS   = 1
+
+# 수채화 스무딩(질감 억제)
+MEANSHIFT_SP, MEANSHIFT_SR = 12, 24
+BILATERAL_D,  BILATERAL_SC, BILATERAL_SS = 7, 45, 9
+
+# -----------------------------
+# HF 로그인(캐시만)
+# -----------------------------
 dotenv.load_dotenv()
-hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-if not hf_token:
-    print(":x: 'HUGGINGFACE_TOKEN'/.env 가 없습니다. 예: HUGGINGFACE_TOKEN=hf_xxx")
-    raise SystemExit(1)
-login(token=hf_token)
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+assert HF_TOKEN, "HUGGINGFACE_TOKEN(.env)에 토큰을 넣어주세요."
+login(token=HF_TOKEN, add_to_git_credential=False)
+os.environ["HF_HUB_OFFLINE"] = "1"
+print("✅ HF login ok (cache only)")
 
-
-# ==============================
-# 2) 기본 장치/정밀도 & 모델 로드
-# ==============================
 use_cuda = torch.cuda.is_available()
-precision = torch.float16 if use_cuda else torch.float32  # diffusers==0.27.2는 torch_dtype 사용
+precision = torch.float16 if use_cuda else torch.float32
 
-# ControlNet (Canny)
-controlnet = ControlNetModel.from_pretrained(
-    "lllyasviel/sd-controlnet-canny",
-    torch_dtype=precision,
-)
+def smart_load_image(p):
+    pr = urlparse(str(p))
+    if pr.scheme in ("http","https"):
+        raise SystemExit("URL은 오프라인 모드 불가. 로컬 경로 사용.")
+    path = Path(p)
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    if not path.exists():
+        d = Path(__file__).resolve().parent / "inputs"
+        cs = [q for q in d.glob("*.*") if q.suffix.lower() in {".jpg",".jpeg",".png",".webp"}]
+        assert cs, "inputs 폴더에 이미지 넣어주세요."
+        print(f"⚠ SOURCE_IMAGE 없음 → {cs[0].name} 사용")
+        path = cs[0]
+    return Image.open(path).convert("RGB")
 
-# SD 1.5 + ControlNet 파이프라인
-pipe = StableDiffusionControlNetPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    controlnet=controlnet,
-    torch_dtype=precision,
-)
+# -----------------------------
+# 엣지맵(전역 밀도 기반)
+# -----------------------------
+def auto_canny_full(gray, low=CANNY_LOW_INIT, high=CANNY_HIGH_INIT,
+                    target=TARGET_EDGE_DENSITY, tol=DENSITY_TOL, max_iter=CANNY_MAX_ITER):
+    total = gray.size
+    l, h = low, high
+    for _ in range(max_iter):
+        e = cv2.Canny(gray, l, h)
+        dens = float(np.count_nonzero(e)) / float(total)
+        if   dens > target + tol: l = min(int(l*1.20)+1, 170); h = min(int(h*1.20)+1, 250)
+        elif dens < target - tol: l = max(int(l*0.85),   5);   h = max(int(h*0.85),   20)
+        else: break
+    return cv2.Canny(gray, l, h)
 
-# 부드러운 톤을 위한 VAE 교체
-vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=precision)
-pipe.vae = vae
-pipe.enable_vae_slicing()
+def post_clean_edges(edges):
+    out = edges.copy()
+    if EDGE_ERODE_ITERS > 0:
+        out = cv2.erode(out, np.ones((3,3), np.uint8), iterations=EDGE_ERODE_ITERS)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((out>0).astype(np.uint8), connectivity=8)
+    clean = np.zeros_like(out)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= MIN_COMPONENT_AREA:
+            clean[labels == i] = 255
+    return clean
 
-# 스케줄러: 미드톤/대비 과다 방지를 위해 EulerAncestral 권장
+def build_edge_input(pil):
+    rgb = np.array(pil)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    # 수채화 스무딩 → 배경/털 텍스처 억제
+    ms  = cv2.pyrMeanShiftFiltering(bgr, sp=MEANSHIFT_SP, sr=MEANSHIFT_SR)
+    sm  = cv2.bilateralFilter(ms, d=BILATERAL_D, sigmaColor=BILATERAL_SC, sigmaSpace=BILATERAL_SS)
+    gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+    # 전역 밀도 기반 Canny
+    e = auto_canny_full(gray)
+    e = post_clean_edges(e)
+    e3 = np.repeat(e[:, :, None], 3, axis=2)
+    return Image.fromarray(e3).convert("RGB")
+
+def balance_tone(pil, desat=0.95, gamma=1.0):
+    bgr=cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR).astype(np.float32)/255.0
+    hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV); hsv[...,1]*=float(desat)
+    bgr=cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR); bgr=np.clip(bgr**float(gamma),0,1)
+    return Image.fromarray(cv2.cvtColor((bgr*255).astype(np.uint8),cv2.COLOR_BGR2RGB))
+
+# -----------------------------
+# 파이프라인(캐시)
+# -----------------------------
+try:
+    controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny",
+                                                 torch_dtype=precision, local_files_only=True)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        controlnet=controlnet,
+        torch_dtype=precision,
+        local_files_only=True,
+    )
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse",
+                                        torch_dtype=precision, local_files_only=True)
+    pipe.vae = vae
+except Exception as e:
+    raise SystemExit("❌ 캐시에 모델이 없습니다. 인터넷 가능한 곳에서 한 번 받아 캐시 복사하세요.\n원인: " + str(e))
+
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+pipe.enable_vae_slicing(); pipe.enable_attention_slicing()
+pipe.load_lora_weights(str(LORA_FILE.parent), weight_name=LORA_FILE.name, adapter_name="minhwa")
+pipe.set_adapters(["minhwa"], adapter_weights=[ADAPTER_WEIGHT])
+if use_cuda: pipe.to("cuda")
 
-# 메모리 최적화
-pipe.enable_attention_slicing()
-if use_cuda:
-    pipe.to("cuda")
-
-# LoRA 로드 (peft 필요)
-pipe.load_lora_weights(
-    "./sd15_lora_minhwa/checkpoint-15000",
-    weight_name="pytorch_lora_weights.safetensors",
-    adapter_name="minhwa",
-)
-pipe.set_adapters(["minhwa"], adapter_weights=[1.00])  # 루프에서 변경 가능
-
-
-# ==============================
-# 3) 유틸 함수
-# ==============================
-def get_canny_image(image_path, low_threshold=20, high_threshold=60):
-    """원본 이미지를 Canny 엣지(3채널 RGB)로 변환"""
-    img = load_image(image_path)    # PIL
-    arr = np.array(img)             # HWC, uint8
-    edges = cv2.Canny(arr, low_threshold, high_threshold)
-    edges = np.repeat(edges[:, :, None], 3, axis=2)
-    return Image.fromarray(edges).convert("RGB")
-
-
-def balance_tone(pil_img, desat=0.93, gamma=0.96, clahe_clip=1.2):
-    """
-    아주 약한 톤 보정:
-      - desat: 채도 93%만 유지(7% 감소)
-      - gamma: 0.96 → 미드톤 살짝 리프트(밝기↑)
-      - clahe_clip: CLAHE로 L채널 미드톤 조금 올림
-    """
-    if desat is None and gamma is None and clahe_clip is None:
-        return pil_img
-
-    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR).astype(np.float32) / 255.0
-
-    if desat is not None:
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        hsv[..., 1] = np.clip(hsv[..., 1] * float(desat), 0, 1)
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-    if clahe_clip is not None:
-        lab = cv2.cvtColor((bgr * 255).astype(np.uint8), cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=(8, 8))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR).astype(np.float32) / 255.0
-
-    if gamma is not None:
-        bgr = np.clip(bgr ** float(gamma), 0, 1)
-
-    rgb = cv2.cvtColor((bgr * 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
-
-
-def save_overwrite(pil_img: Image.Image, path: Path):
-    """같은 파일명이 있으면 삭제 후 저장(덮어쓰기 보장)"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.unlink()
-    pil_img.save(path)
-
-
-# ==============================
-# 4) 프롬프트 (중간 톤 지시)
-# ==============================
+# -----------------------------
+# 프롬프트(주제 명시 + 인물 네거티브)
+# -----------------------------
 prompt = (
-    "<minhwastyle>, traditional Korean minhwa painting, joseon style, "
-    "soft pastel tones, muted colors, low saturation, soft contrast, balanced exposure, "
-    "watercolor ink wash texture, calm and airy mood, elegant korean aesthetics"
+    "a dog sitting with a twig in mouth, "
+    "<minhwastyle>, traditional Korean minhwa watercolor (damchae), "
+    "soft ink outlines, light washes on hanji paper, muted pastel palette, calm mood"
 )
 negative_prompt = (
-    "photo, realistic, 3d render, neon, vivid, high saturation, intense colors, "
-    "harsh contrast, crushed blacks, blown highlights, dark, dim, muddy colors"
+    "human, woman, geisha, portrait of person, photo, photorealistic, hdr, 3d render, "
+    "oil painting, western style, neon, vivid, high saturation, harsh contrast, plastic, metallic, noise, artifacts"
 )
 
-# 공통
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-generator = torch.Generator(device="cuda" if use_cuda else "cpu").manual_seed(SEED)
+# -----------------------------
+# 생성
+# -----------------------------
+src_pil  = smart_load_image(SOURCE_IMAGE)
+edge_pil = build_edge_input(src_pil)        # ★ 마스크 없이 전역 엣지
+W, H = edge_pil.width, edge_pil.height
 
+gen = torch.Generator(device="cuda" if use_cuda else "cpu").manual_seed(SEED)
+img = pipe(
+    prompt=prompt,
+    negative_prompt=negative_prompt,
+    image=edge_pil,
+    num_inference_steps=STEPS,
+    guidance_scale=CFG,
+    controlnet_conditioning_scale=CN_SCALE,
+    control_guidance_start=GUIDE_START,
+    control_guidance_end=GUIDE_END,
+    guess_mode=False,
+    width=W, height=H,
+    generator=gen,
+).images[0]
 
-# ==============================
-# 5) A안 — 중간 톤 프리셋 1장
-# ==============================
-if RUN_MID_PRESET:
-    CFG = 6.0
-    STEPS = 36
-    CN = 0.46
-    LOW, HIGH = 22, 64
-    LORA_W = 1.00
-
-    base_image = get_canny_image(SOURCE_IMAGE, LOW, HIGH)
-    pipe.set_adapters(["minhwa"], adapter_weights=[LORA_W])
-
-    img = pipe(
-        prompt=prompt,
-        image=base_image,
-        negative_prompt=negative_prompt,
-        num_inference_steps=STEPS,
-        guidance_scale=CFG,
-        controlnet_conditioning_scale=CN,
-        generator=generator,
-    ).images[0]
-
-    img = balance_tone(img, desat=0.93, gamma=0.96, clahe_clip=1.2)
-    save_overwrite(img, OUT_DIR / "minhwa_mid_preset.png")
-    print("✔ Saved:", OUT_DIR / "minhwa_mid_preset.png")
-
-
-# ==============================
-# 6) B안 — 중간대 그리드(기본 18장)
-#    12장으로 줄이려면 CN_SCALES를 2개로 줄이면 됨.
-# ==============================
-if RUN_GRID:
-    LORA_STRENGTHS = [0.95, 1.00, 1.05]                # LoRA 강도
-    CN_SCALES      = [0.42, 0.46, 0.50]                # ControlNet 스케일(중간대)
-    CANNY_SETS     = [(20, 60), (25, 70)]              # Canny 두 구간 → 3*3*2 = 18장
-
-    NUM_STEPS      = 36
-    GUIDANCE_SCALE = 6.0
-    DESAT_FACTOR   = 0.93
-    GAMMA          = 0.96
-    CLAHE_CLIP     = 1.2
-
-    total = len(LORA_STRENGTHS) * len(CN_SCALES) * len(CANNY_SETS)
-    idx = 0
-
-    for (low, high) in CANNY_SETS:
-        subdir = OUT_DIR / f"grid_canny_{low}-{high}"
-        subdir.mkdir(parents=True, exist_ok=True)
-
-        base_image = get_canny_image(SOURCE_IMAGE, low_threshold=low, high_threshold=high)
-
-        for w in LORA_STRENGTHS:
-            pipe.set_adapters(["minhwa"], adapter_weights=[w])
-
-            for cn in CN_SCALES:
-                idx += 1
-                print(f"[{idx:02d}/{total}] Canny={low}-{high}, LoRA={w:.2f}, CN={cn:.2f}")
-
-                img = pipe(
-                    prompt=prompt,
-                    image=base_image,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=NUM_STEPS,
-                    guidance_scale=GUIDANCE_SCALE,
-                    controlnet_conditioning_scale=cn,
-                    generator=generator,  # 고정 시드 → 조건 차이만 반영
-                ).images[0]
-
-                img = balance_tone(img, desat=DESAT_FACTOR, gamma=GAMMA, clahe_clip=CLAHE_CLIP)
-
-                fname = subdir / f"minhwa_c{low}-{high}_w{w:.2f}_cn{cn:.2f}.png"
-                save_overwrite(img, fname)
-                print("   -> Saved:", fname)
-
-    print(f"✔ Grid done. dir = {OUT_DIR.resolve()}")
+img = balance_tone(img, desat=0.95, gamma=1.0)
+out = Path(OUT_PATH); out.parent.mkdir(parents=True, exist_ok=True)
+if out.exists(): out.unlink()
+img.save(out)
+print("✔ Saved:", out)
