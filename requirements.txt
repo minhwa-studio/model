@@ -1,4 +1,8 @@
-torch
+fastapi
+uvicorn
+diffusers==0.27.2
+safetensors
+torch>=2.1
 torchvision
 accelerate
 transformers
@@ -7,6 +11,7 @@ Pillow
 tqdm
 python-dotenv
 opencv-python
+
 
 # numpy 버전 확인 -> numpy-2.2.6
 
