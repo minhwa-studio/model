@@ -6,5 +6,10 @@ huggingface_hub
 Pillow
 tqdm
 python-dotenv
+opencv-python
+
+# numpy 버전 확인 -> numpy-2.2.6
+
+# diffusers 버전 확인 필수 -> Version: 0.36.0.dev0  -> 확인용 코드 pip show diffusers
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 # pip install --upgrade git+https://github.com/huggingface/diffusers.git

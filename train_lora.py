@@ -42,11 +42,11 @@ try:
         "--learning_rate=5e-5",
         "--lr_scheduler=cosine",
         "--lr_warmup_steps=0",
-        "--max_train_steps=26110",
+        "--max_train_steps=52220",
         "--checkpointing_steps=1000",
         "--seed=2025",
         "--gradient_checkpointing",
-        "--resume_from_checkpoint=checkpoint-2000"
+        "--resume_from_checkpoint=checkpoint-5000"
     ], check=True)
     print("\n학습이 성공적으로 완료")
 except FileNotFoundError:

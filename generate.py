@@ -19,8 +19,8 @@ pipe = StableDiffusionControlNetPipeline.from_pretrained(
     torch_dtype=torch.float16
 )
 
-# 2000 스텝까지 학습된 LoRA 가중치 적용
-pipe.load_lora_weights("./sd15_lora_minhwa/checkpoint-2000", weight_name="pytorch_lora_weights.safetensors")
+# 5000 스텝까지 학습된 LoRA 가중치 적용
+pipe.load_lora_weights("./sd15_lora_minhwa/checkpoint-5000", weight_name="pytorch_lora_weights.safetensors")
 
 # 스케줄러 설정 (일반적으로 UniPCMultistepScheduler를 사용)
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
@@ -50,7 +50,7 @@ source_image_path = "./inputs/img1.jpg"
 base_image = get_canny_image(source_image_path)
 
 # 프롬프트 설정
-prompt = "<minhwastyle> painting, oriental ink painting, watercolor, vibrant colors, subtle brush strokes, harmony, a bird on a branch, detailed background"
+prompt = "<minhwastyle>, oriental ink painting, watercolor, vibrant colors, subtle brush strokes, harmony, a bird on a branch, detailed background"
 negative_prompt = "japanese style, chinese style, western painting, oil painting, impressionist, very dark, very bright, saturated colors, photography, bad art, blurry, ugly, duplicate"
 
 # 이미지 생성
@@ -60,7 +60,7 @@ generated_image = pipe(
     image=base_image,
     negative_prompt=negative_prompt,
     num_inference_steps=20,
-    guidance_scale=7.5,
+    guidance_scale=6.5,
     controlnet_conditioning_scale=0.8
 ).images[0]
 
